@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+# coding: utf-8
 """
-Delivery Profit Bot - full implementation (Variant A)
-Storage: JSON
-Usage:
-  - Set environment variable BOT_TOKEN with your Telegram bot token.
-  - Run: python bot.py
+Delivery Profit Bot (aiogram, JSON storage)
+
+Commands:
+  /start, /open, /close, /max, /min, /off, /report
+
+Environment variables:
+  BOT_TOKEN - required
+  UNIQUE_USER_ID - optional (admin copy), default 542345855
 """
 
 import os
@@ -13,25 +17,24 @@ import asyncio
 import json
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from collections import defaultdict
+from typing import Dict, Any, List
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Please set BOT_TOKEN environment variable")
 
-# timezone (UTC+3)
-TZ = ZoneInfo("Europe/Minsk")
+UNIQUE_USER_ID = int(os.getenv("UNIQUE_USER_ID", 542345855))
 
-# Unique admin/user ID to receive daily copies
-ADMIN_USER_ID = int(os.getenv("UNIQUE_USER_ID", 542345855))
+TZ = ZoneInfo("Europe/Minsk")  # UTC+3
 
-# Allowed chat_id:thread_id mapping
+DATA_FILE = "data.json"
+
+# chat_id -> thread_id (use the mapping you provided)
 ALLOWED = {
     -1002079167705: 48,
     -1002936236597: 3,
@@ -60,11 +63,9 @@ CHAT_NAMES = {
     -1002538985387: "L. Lamour.by - Кропоткина, 84",
 }
 
-DATA_FILE = "data.json"
-
-# price map per spec
-PRICE_BASE = 10.00  # '+' in city
-PRICE_MK = 5.00
+# PRICES (your latest spec)
+PRICE_BASE = 10.00   # '+'
+PRICE_MK = 5.00      # 'мк'
 PRICE_GAB_UNIT = 7.00  # n*габ base
 COLORS = {
     "синяя": 8.00, "красная": 16.00, "оранжевая": 25.00, "салатовая": 33.00,
@@ -72,26 +73,32 @@ COLORS = {
     "голубая": 76.00
 }
 
-def load_data():
+# ---------------- Data persistence ----------------
+def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         return {"drivers": {}, "entries": []}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"drivers": {}, "entries": []}
 
-def save_data(data):
+def save_data(d: Dict[str, Any]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2)
 
 DATA = load_data()
 
-def next_entry_id():
-    ids = [e["id"] for e in DATA.get("entries", [])] or [0]
+def next_entry_id() -> int:
+    ids = [e.get("id", 0) for e in DATA.get("entries", [])] or [0]
     return max(ids) + 1
 
-def now_iso():
+def now_iso() -> str:
     return datetime.now(TZ).isoformat()
 
+# ---------------- Parsing utilities ----------------
 def parse_cash_from_text(text: str) -> float:
+    # finds first number potentially followed by "р", "руб", etc.
     m = re.search(r"(\d+[.,]?\d*)(?=\s*(р|руб|руб\.|р\.)?)", text)
     if m:
         try:
@@ -100,11 +107,19 @@ def parse_cash_from_text(text: str) -> float:
             return 0.0
     return 0.0
 
-def compute_earn_from_text(text: str) -> (float, list):
-    text_l = text.lower()
+def compute_earn_from_text(text: str) -> (float, List[str]):
+    """
+    Parse triggers after first '+'.
+    Supports:
+      - ++ double
+      - мк token
+      - colors
+      - nгаб (e.g. 2габ or 2 габ)
+    """
+    text_l = (text or "").lower()
     if "+" not in text_l:
         return 0.0, []
-    after = text_l.split("+", 1)[1]
+    # detect '++' anywhere -> double base
     earn = 0.0
     triggers = []
     if "++" in text_l:
@@ -113,144 +128,148 @@ def compute_earn_from_text(text: str) -> (float, list):
     else:
         earn += PRICE_BASE
         triggers.append("+")
+    # substring after first '+'
+    after = text_l.split("+", 1)[1]
+    # detect 'мк' (word boundary)
     if re.search(r"\bмк\b", after):
         earn += PRICE_MK
         triggers.append("мк")
-    for color in COLORS.keys():
+    # detect colors
+    for color, price in COLORS.items():
         if color in after:
-            earn += COLORS[color]
+            earn += price
             triggers.append(color)
+    # detect n*габ or nгаб or 'n габ'
     for m in re.finditer(r"(\d+)\s*\*?\s*габ", after):
-        n = int(m.group(1))
-        earn += n * PRICE_GAB_UNIT
-        triggers.append(f"{n}габ")
+        try:
+            n = int(m.group(1))
+            earn += n * PRICE_GAB_UNIT
+            triggers.append(f"{n}габ")
+        except:
+            pass
+    # single 'габ'
     if re.search(r"\bгаб\b", after) and not re.search(r"\d+\s*\*?\s*габ", after):
         earn += PRICE_GAB_UNIT
         triggers.append("габ")
-    return round(earn,2), triggers
+    return round(earn, 2), triggers
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+# ---------------- Bot and runtime state ----------------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-BOT = Bot(token=BOT_TOKEN)
-DP = Dispatcher()
+# message_id -> scheduled task
+SCHEDULED: Dict[int, asyncio.Task] = {}
+# awaiting correction: user_id -> dict(orig_chat, orig_message_id, bot_reply_id, expecting_private)
+AWAITING_CORRECTION: Dict[int, Dict[str, Any]] = {}
 
-SCHEDULED_TASKS = {}
-AWAITING_CORRECTION = {}
-
-# command handlers
-@DP.message(Command(commands=["start"]))
-async def cmd_start(msg: types.Message):
+# ---------------- Commands ----------------
+@dp.message(Command(commands=["start"]))
+async def cmd_start(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="/open - открыть смену", callback_data="noop")],
         [InlineKeyboardButton(text="/close - закрыть смену", callback_data="noop")],
         [InlineKeyboardButton(text="/report - сформировать отчет", callback_data="noop")],
     ])
-    await msg.answer(
-        "Привет! Я фиксирую отметки по доставкам.\n\nДоступные команды:\n"
-        "/open - открыть смену\n/close - закрыть смену\n/max - подробный режим (уведомления сразу)\n/min - итоговый режим (уведомления в конце)\n/report - сформировать отчет (после /close, через 5 мин)\n/off - выйти с линии (нужно перед /report)",
+    await m.answer(
+        "Привет! Я фиксирую отметки.\n\nКоманды:\n"
+        "/open - открыть смену\n/close - закрыть смену\n/max - подробный режим\n/min - итоговый режим\n/off - выйти с линии (перед /report)\n/report - сформировать отчет (после /close и через 5 минут)",
         reply_markup=kb
     )
 
-@DP.message(Command(commands=["open"]))
-async def cmd_open(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["open"]))
+async def cmd_open(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    state["open"] = True
-    state["open_time"] = now_iso()
-    state["mode"] = state.get("mode", "min")
-    state["entries"] = state.get("entries", [])
-    state["last_activity"] = now_iso()
-    state["off"] = False
-    drivers[str(user)] = state
+    st = drivers.get(uid, {})
+    st["open"] = True
+    st["open_time"] = now_iso()
+    st["mode"] = st.get("mode", "min")
+    st["entries"] = st.get("entries", [])
+    st["last_activity"] = now_iso()
+    st["off"] = False
+    drivers[uid] = st
     save_data(DATA)
-    await msg.reply(f"Вы на линии с {datetime.now(TZ).strftime('%H:%M:%S')}! Режим: {state['mode']} (по умолчанию /min)")
+    await m.reply(f"Вы на линии с {datetime.now(TZ).strftime('%H:%M:%S')}! Режим: {st['mode']}")
 
-@DP.message(Command(commands=["max"]))
-async def cmd_max(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["max"]))
+async def cmd_max(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    state["mode"] = "max"
-    drivers[str(user)] = state
+    st = drivers.get(uid, {})
+    st["mode"] = "max"
+    drivers[uid] = st
     save_data(DATA)
-    await msg.reply("Режим оповещений: подробный (/max). После каждой отметки бот будет присылать начисления.")
+    await m.reply("Режим оповещений: подробный (/max).")
 
-@DP.message(Command(commands=["min"]))
-async def cmd_min(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["min"]))
+async def cmd_min(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    state["mode"] = "min"
-    drivers[str(user)] = state
+    st = drivers.get(uid, {})
+    st["mode"] = "min"
+    drivers[uid] = st
     save_data(DATA)
-    await msg.reply("Режим оповещений: в конце дня (/min). Бот будет накапливать отметки.")
+    await m.reply("Режим оповещений: в конце дня (/min).")
 
-@DP.message(Command(commands=["off"]))
-async def cmd_off(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["off"]))
+async def cmd_off(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    state["off"] = True
-    drivers[str(user)] = state
+    st = drivers.get(uid, {})
+    st["off"] = True
+    drivers[uid] = st
     save_data(DATA)
-    await msg.reply("Вы ушли с линии. Теперь можно формировать отчет после /close.")
+    await m.reply("Вы ушли с линии. Теперь можно формировать отчет после /close.")
 
-@DP.message(Command(commands=["close"]))
-async def cmd_close(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["close"]))
+async def cmd_close(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    if not state.get("open"):
-        await msg.reply("Смена не была открыта.")
+    st = drivers.get(uid, {})
+    if not st.get("open"):
+        await m.reply("Смена не была открыта.")
         return
-    state["open"] = False
-    state["close_time"] = now_iso()
-    drivers[str(user)] = state
+    st["open"] = False
+    st["close_time"] = now_iso()
+    drivers[uid] = st
     save_data(DATA)
-    asyncio.create_task(wait_and_create_report(user, delay=5*60))
-    await msg.reply("Смена закрыта. Через 5 минут можно формировать /report.")
+    # schedule ready flag after 5 minutes
+    async def ready_flag(u):
+        await asyncio.sleep(5*60)
+        DATA.setdefault("drivers", {}).setdefault(u, {})["ready_for_report"] = True
+        save_data(DATA)
+    asyncio.create_task(ready_flag(uid))
+    await m.reply("Смена закрыта. Через 5 минут можно формировать /report.")
 
-async def wait_and_create_report(user_id: int, delay: int = 300):
-    await asyncio.sleep(delay)
-    data = DATA
-    drivers = data.setdefault("drivers", {})
-    state = drivers.get(str(user_id), {})
-    state["ready_for_report"] = True
-    drivers[str(user_id)] = state
-    save_data(data)
-
-@DP.message(Command(commands=["report"]))
-async def cmd_report(msg: types.Message):
-    user = msg.from_user.id
+@dp.message(Command(commands=["report"]))
+async def cmd_report(m: types.Message):
+    uid = str(m.from_user.id)
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    if state.get("open"):
-        await msg.reply("Сначала закрой смену командой /close.")
+    st = drivers.get(uid, {})
+    if st.get("open"):
+        await m.reply("Сначала закройте смену командой /close.")
         return
-    if not state.get("ready_for_report"):
-        await msg.reply("Отчёт будет доступен через 5 минут после /close.")
+    if not st.get("ready_for_report"):
+        await m.reply("Отчёт будет доступен через 5 минут после /close.")
         return
-    if not state.get("off"):
-        await msg.reply("Перед формированием отчёта войдите с линии командой /off.")
+    if not st.get("off"):
+        await m.reply("Перед формированием отчёта выполните /off.")
         return
-    open_t = datetime.fromisoformat(state.get("open_time")) if state.get("open_time") else None
-    close_t = datetime.fromisoformat(state.get("close_time")) if state.get("close_time") else None
+    open_t = datetime.fromisoformat(st.get("open_time")) if st.get("open_time") else None
+    close_t = datetime.fromisoformat(st.get("close_time")) if st.get("close_time") else None
     entries = []
     for e in DATA.get("entries", []):
-        if e["driver_id"] == user and e["processed"]:
+        if str(e.get("driver_id")) == uid and e.get("processed"):
             et = datetime.fromisoformat(e["accepted_ts"])
             if open_t and close_t and open_t <= et <= close_t:
                 entries.append(e)
-    total_income = sum(e["earn"] for e in entries)
-    total_cash = sum(e.get("cash",0.0) for e in entries)
-    balance = round(total_cash - total_income,2)
+    total_income = sum(e.get("earn", 0.0) for e in entries)
+    total_cash = sum(e.get("cash", 0.0) for e in entries)
+    balance = round(total_cash - total_income, 2)
     count = len(entries)
-    text_lines = [
-        f"{datetime.now(TZ).strftime('%d.%m.%Y')}",
-        f"{msg.from_user.full_name} (id:{user})",
+    lines = [
+        datetime.now(TZ).strftime("%d.%m.%Y"),
+        f"{m.from_user.full_name} (id:{m.from_user.id})",
         "",
         f"Доход: {total_income:.2f} BYN",
         f"Наличные: {total_cash:.2f} BYN",
@@ -264,47 +283,52 @@ async def cmd_report(msg: types.Message):
         by_chat.setdefault(e["chat_id"], []).append(e)
     for cid, lst in by_chat.items():
         name = CHAT_NAMES.get(int(cid), str(cid))
-        text_lines.append(f"{name}:")
-        for e in lst:
-            text_lines.append(f" - {e['text']} ({e['earn']:.2f} BYN, cash {e.get('cash',0.0):.2f})")
-        text_lines.append("")
-    report_text = "\n".join(text_lines)
-    await msg.reply(report_text)
+        lines.append(f"{name}:")
+        for item in lst:
+            lines.append(f" - {item['text']} ({item['earn']:.2f} BYN, cash {item.get('cash',0.0):.2f})")
+        lines.append("")
+    report_text = "\n".join(lines)
+    await m.reply(report_text)
+    # send copy to admin
     try:
-        await BOT.send_message(ADMIN_USER_ID, f"[Отчёт водителя] {report_text}")
+        await bot.send_message(UNIQUE_USER_ID, f"[Отчёт водителя]\n{report_text}")
     except Exception:
         pass
-    state["ready_for_report"] = False
+    st["ready_for_report"] = False
     save_data(DATA)
 
-@DP.message()
-async def handle_any_message(msg: types.Message):
-    if msg.chat.id not in ALLOWED:
+# ---------------- Message handling in allowed threads ----------------
+@dp.message()
+async def handle_messages(m: types.Message):
+    # process only allowed chats & threads
+    if m.chat.id not in ALLOWED:
         return
-    expected_thread = ALLOWED[msg.chat.id]
-    if msg.message_thread_id != expected_thread:
+    expected = ALLOWED[m.chat.id]
+    if m.message_thread_id != expected:
         return
-    user = msg.from_user.id
+    uid = m.from_user.id
     drivers = DATA.setdefault("drivers", {})
-    state = drivers.get(str(user), {})
-    if not state.get("open"):
+    st = drivers.get(str(uid), {})
+    # only record if driver is on shift
+    if not st.get("open"):
         return
-    text = msg.text or ""
+    text = m.text or ""
     if "+" not in text:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Повторная запись отметки", callback_data=f"repeat|{msg.chat.id}|{msg.message_id}")]
+            [InlineKeyboardButton(text="Повторная запись отметки", callback_data=f"repeat|{m.chat.id}|{m.message_id}")]
         ])
-        sent = await msg.reply("Ошибка. Отсутствует основной триггер. Пожалуйста, нажмите кнопку «повторная запись отметки» и введите данные корректно", reply_markup=kb)
-        AWAITING_CORRECTION[user] = {"orig_chat": msg.chat.id, "orig_msg": msg.message_id, "bot_msg": sent.message_id}
+        sent = await m.reply("Ошибка. Отсутствует основной триггер. Пожалуйста, нажмите кнопку «повторная запись отметки» и введите данные корректно", reply_markup=kb)
+        AWAITING_CORRECTION[uid] = {"orig_chat": m.chat.id, "orig_msg": m.message_id, "bot_msg": sent.message_id, "expecting_private": False}
         return
-    entry_id = next_entry_id()
+    # create entry and schedule processing in 5 minutes
+    eid = next_entry_id()
     entry = {
-        "id": entry_id,
-        "driver_id": user,
-        "chat_id": msg.chat.id,
-        "thread_id": msg.message_thread_id,
+        "id": eid,
+        "driver_id": uid,
+        "chat_id": m.chat.id,
+        "thread_id": m.message_thread_id,
         "text": text,
-        "ts": msg.date.astimezone(TZ).isoformat(),
+        "ts": m.date.astimezone(TZ).isoformat(),
         "processed": False,
         "accepted_ts": None,
         "earn": 0.0,
@@ -312,9 +336,9 @@ async def handle_any_message(msg: types.Message):
     }
     DATA.setdefault("entries", []).append(entry)
     save_data(DATA)
-    async def delayed_process(entry_local, user_local, chat_local):
+    async def delayed(eid_local, user_local, chat_local):
         await asyncio.sleep(5*60)
-        e = next((x for x in DATA.get("entries", []) if x["id"]==entry_local["id"]), None)
+        e = next((x for x in DATA.get("entries", []) if x["id"] == eid_local), None)
         if not e:
             return
         earn, triggers = compute_earn_from_text(e["text"])
@@ -324,49 +348,53 @@ async def handle_any_message(msg: types.Message):
         e["processed"] = True
         e["accepted_ts"] = now_iso()
         save_data(DATA)
-        state_l = DATA.setdefault("drivers", {}).get(str(user_local), {})
-        state_l["last_activity"] = now_iso()
-        DATA["drivers"][str(user_local)] = state_l
+        # update driver's last activity
+        st_local = DATA.setdefault("drivers", {}).get(str(user_local), {})
+        st_local["last_activity"] = now_iso()
+        DATA["drivers"][str(user_local)] = st_local
         save_data(DATA)
-        if state_l.get("mode","min") == "max":
-            summary = (f"+{earn:.2f} BYN • {cash:.2f} BYN\n"
-                       f"{CHAT_NAMES.get(chat_local, str(chat_local))}\n"
-                       f"{e['ts']}\n\nАдрес: {e['text'].split('+')[0].strip()}\nТриггеры: {', '.join(triggers)}\n\n"
-                       f"Доход за смену: {calc_driver_total(user_local):.2f} BYN\nБаланс за смену: {calc_driver_balance(user_local):.2f} BYN")
+        # if driver in max mode, notify immediately
+        if st_local.get("mode", "min") == "max":
             try:
-                await BOT.send_message(user_local, summary)
+                summary = (f"+{earn:.2f} BYN • {cash:.2f} BYN\n"
+                           f"{CHAT_NAMES.get(chat_local, str(chat_local))}\n"
+                           f"{e['ts']}\n\nАдрес: {e['text'].split('+')[0].strip()}\nТриггеры: {', '.join(triggers)}\n\n"
+                           f"Доход за смену: {calc_driver_total(user_local):.2f} BYN\nБаланс за смену: {calc_driver_balance(user_local):.2f} BYN")
+                await bot.send_message(user_local, summary)
             except Exception:
                 pass
-    task = asyncio.create_task(delayed_process(entry, user, msg.chat.id))
-    SCHEDULED_TASKS[entry_id] = task
-    await msg.reply("Отметка принята. Данные будут зафиксированы через 5 минут (можно исправить).")
+    task = asyncio.create_task(delayed(eid, uid, m.chat.id))
+    SCHEDULED[eid] = task
+    await m.reply("Отметка принята. Данные будут зафиксированы через 5 минут (можно исправить).")
 
-@DP.callback_query(lambda c: c.data and c.data.startswith("repeat|"))
-async def cb_repeat(call: types.CallbackQuery):
-    parts = call.data.split("|")
-    user = call.from_user.id
+# callback: repeat flow
+@dp.callback_query(lambda c: c.data and c.data.startswith("repeat|"))
+async def callback_repeat(c: CallbackQuery):
+    parts = c.data.split("|")
+    user = c.from_user.id
     if AWAITING_CORRECTION.get(user) is None:
-        await call.answer("Нет ожидающих исправлений.", show_alert=False)
+        await c.answer("Нет ожидающих исправлений.", show_alert=False)
         return
-    await call.message.answer("Правильная отметка:")
+    await c.message.answer("Правильная отметка:")
     AWAITING_CORRECTION[user]["expecting_private"] = True
-    await call.answer()
+    await c.answer()
 
-@DP.message(lambda m: m.chat.type == "private")
-async def private_message(msg: types.Message):
-    user = msg.from_user.id
+# private messages: handle corrected input
+@dp.message(lambda m: m.chat.type == "private")
+async def private_handler(m: types.Message):
+    user = m.from_user.id
     if user in AWAITING_CORRECTION and AWAITING_CORRECTION[user].get("expecting_private"):
-        text = msg.text or ""
+        text = m.text or ""
         if "+" not in text:
-            await msg.reply("Ошибка. В корректной отметке отсутствует '+'. Попробуйте ещё раз.")
+            await m.reply("Ошибка. В корректной отметке отсутствует '+'. Попробуйте ещё раз.")
             return
         info = AWAITING_CORRECTION[user]
         orig_chat = info["orig_chat"]
         orig_msg = info["orig_msg"]
         bot_msg = info["bot_msg"]
-        entry_id = next_entry_id()
+        eid = next_entry_id()
         entry = {
-            "id": entry_id,
+            "id": eid,
             "driver_id": user,
             "chat_id": orig_chat,
             "thread_id": ALLOWED.get(orig_chat),
@@ -383,48 +411,52 @@ async def private_message(msg: types.Message):
         entry["cash"] = cash
         DATA.setdefault("entries", []).append(entry)
         save_data(DATA)
-        await msg.reply("Отметка принята! Старые пометки записи будут удалены в автоматическом режиме через некоторое время")
-        async def delayed_delete():
+        await m.reply("Отметка принята! Старые пометки записи будут удалены в автоматическом режиме через некоторое время")
+        # schedule deletion of original bad messages after 3 minutes
+        async def delayed_del():
             await asyncio.sleep(3*60)
             try:
-                await BOT.delete_message(chat_id=orig_chat, message_id=orig_msg)
+                await bot.delete_message(chat_id=orig_chat, message_id=orig_msg)
             except Exception:
                 pass
             try:
-                await BOT.delete_message(chat_id=orig_chat, message_id=bot_msg)
+                await bot.delete_message(chat_id=orig_chat, message_id=bot_msg)
             except Exception:
                 pass
             try:
-                await BOT.delete_message(chat_id=user, message_id=msg.message_id)
+                await bot.delete_message(chat_id=user, message_id=m.message_id)
             except Exception:
                 pass
-        asyncio.create_task(delayed_delete())
+        asyncio.create_task(delayed_del())
+        # notify if max mode
         drivers = DATA.setdefault("drivers", {})
-        state = drivers.get(str(user), {})
-        if state.get("mode") == "max":
+        st = drivers.get(str(user), {})
+        if st.get("mode") == "max":
             try:
-                await BOT.send_message(user, f"+{earn:.2f} BYN • {cash:.2f} BYN\n{CHAT_NAMES.get(orig_chat)}\n{entry['ts']}\nАдрес: {text.split('+')[0].strip()}\nТриггеры: {', '.join(triggers)}\n\nДоход за смену: {calc_driver_total(user):.2f} BYN\nБаланс за смену: {calc_driver_balance(user):.2f} BYN")
+                await bot.send_message(user, f"+{earn:.2f} BYN • {cash:.2f} BYN\n{CHAT_NAMES.get(orig_chat)}\n{entry['ts']}\nАдрес: {text.split('+')[0].strip()}\nТриггеры: {', '.join(triggers)}\n\nДоход за смену: {calc_driver_total(user):.2f} BYN\nБаланс за смену: {calc_driver_balance(user):.2f} BYN")
             except Exception:
                 pass
         AWAITING_CORRECTION.pop(user, None)
 
-def calc_driver_total(user_id: int) -> float:
-    total = 0.0
+# ---------------- Utilities for driver totals ----------------
+def calc_driver_total(uid: int) -> float:
+    t = 0.0
     for e in DATA.get("entries", []):
-        if e["driver_id"] == user_id and e.get("processed"):
-            total += float(e.get("earn",0.0))
-    return round(total,2)
+        if e.get("driver_id") == uid and e.get("processed"):
+            t += float(e.get("earn", 0.0))
+    return round(t, 2)
 
-def calc_driver_cash(user_id: int) -> float:
-    total = 0.0
+def calc_driver_cash(uid: int) -> float:
+    t = 0.0
     for e in DATA.get("entries", []):
-        if e["driver_id"] == user_id and e.get("processed"):
-            total += float(e.get("cash",0.0))
-    return round(total,2)
+        if e.get("driver_id") == uid and e.get("processed"):
+            t += float(e.get("cash", 0.0))
+    return round(t, 2)
 
-def calc_driver_balance(user_id: int) -> float:
-    return round(calc_driver_cash(user_id) - calc_driver_total(user_id),2)
+def calc_driver_balance(uid: int) -> float:
+    return round(calc_driver_cash(uid) - calc_driver_total(uid), 2)
 
+# ---------------- Background tasks: inactivity and auto-close ----------------
 async def background_tasks():
     while True:
         now = datetime.now(TZ)
@@ -432,38 +464,42 @@ async def background_tasks():
         for uid, st in list(drivers.items()):
             if not st.get("open"):
                 continue
-            last = datetime.fromisoformat(st.get("last_activity")) if st.get("last_activity") else None
+            last_iso = st.get("last_activity")
+            last = datetime.fromisoformat(last_iso) if last_iso else None
             if last:
                 if (now - last) > timedelta(hours=3) and not st.get("reminder_sent"):
                     try:
-                        await BOT.send_message(int(uid), "Активности нет длительное время. Пожалуйста, закройте смену и сформируйте отчет!")
+                        await bot.send_message(int(uid), "Активности нет длительное время. Пожалуйста, закройте смену и сформируйте отчет!")
                         st["reminder_sent"] = True
                         save_data(DATA)
                     except Exception:
                         pass
                 if st.get("reminder_sent") and (now - last) > timedelta(hours=4):
                     try:
-                        await BOT.send_message(int(uid), "Активности нет длительное время. Пожалуйста, закройте смену и сформируйте отчет!")
+                        await bot.send_message(int(uid), "Активности нет длительное время. Пожалуйста, закройте смену и сформируйте отчет!")
                     except Exception:
                         pass
-        if now.time().hour == 23 and now.time().minute == 0:
+        # auto close at 23:00
+        if now.hour == 23 and now.minute == 0:
             for uid, st in list(drivers.items()):
                 if st.get("open"):
                     st["open"] = False
                     st["close_time"] = now.isoformat()
                     st["ready_for_report"] = True
                     try:
-                        await BOT.send_message(ADMIN_USER_ID, f"Водитель {uid} не закрыл смену — бот закрыл автоматически и сформировал отчёт.")
+                        await bot.send_message(UNIQUE_USER_ID, f"Водитель {uid} не закрыл смену — бот закрыл автоматически.")
                     except Exception:
                         pass
             save_data(DATA)
         await asyncio.sleep(60)
 
+# startup hook
 async def on_startup():
     asyncio.create_task(background_tasks())
 
+# ---------------- Run ----------------
 if __name__ == "__main__":
-    print("Starting bot...")
+    print("Starting delivery profit bot...")
     asyncio.get_event_loop().create_task(on_startup())
     from aiogram import executor
-    executor.start_polling(DP, BOT, skip_updates=True)
+    executor.start_polling(dp, bot, skip_updates=True)
